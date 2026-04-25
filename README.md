@@ -85,11 +85,12 @@ Copy `example_client_config.yaml` or `example_server_config.yaml` and edit. The 
 ```yaml
 github:
   tokens:
-    # Minimal entry (default: git transport)
+    # Minimal entry
     - token: "ghp_your_first_token_here"
+      transport: "git"
       repo: "yourusername/tunnel-data"
 
-    # Explicit gist transport (optional, for clarity)
+    # Explicit gist transport
     - token: "ghp_second_token"
       transport: "gist"
 
@@ -112,13 +113,13 @@ github:
 - `transport` and `repo` are per-token. If omitted, `transport` defaults to `git`. `repo` is required for `git` transport.
 - Only tokens from **different GitHub accounts** multiply your write capacity. Tokens from the same account share one rate-limit pool.
 
-#### Example: Gist transport (default)
+#### Example: Gist transport
 
 ```yaml
 github:
   tokens:
     - token: "ghp_yourtoken"
-      # transport: "gist"  # (default)
+      transport: "gist"
 ```
 
 #### Example: Git Smart HTTP transport

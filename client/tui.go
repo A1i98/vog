@@ -142,19 +142,16 @@ func (m tuiModel) View() string {
 	b.WriteByte('\n')
 	b.WriteString(sep + "\n")
 
-	// Count active connections per token and compute total throughput.
+	// Count active conns per token. The total is the lifetime counter from
+	// the mux (includes bytes from already-closed conns).
 	perToken := make(map[int]int)
-	var totalUp, totalDown int64
 	for _, c := range m.conns {
 		perToken[c.TokenIdx]++
-		totalUp += c.BytesUp
-		totalDown += c.BytesDown
 	}
+	totalUp, totalDown := m.manager.TotalBytes()
 	b.WriteString(headStyle.Render("Connections"))
 	b.WriteString(dimStyle.Render(fmt.Sprintf(" (%d active)", len(m.conns))))
-	if len(m.conns) > 0 {
-		b.WriteString(dimStyle.Render(fmt.Sprintf("  ↑ %s  ↓ %s total", tuiFmtBytes(totalUp), tuiFmtBytes(totalDown))))
-	}
+	b.WriteString(dimStyle.Render(fmt.Sprintf("  ↑ %s  ↓ %s total", tuiFmtBytes(totalUp), tuiFmtBytes(totalDown))))
 	if len(perToken) > 0 {
 		b.WriteString(dimStyle.Render("  ["))
 		sep2 := ""

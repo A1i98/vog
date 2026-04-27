@@ -28,14 +28,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	// In TUI mode, slog goes to a temp file so it doesn't corrupt the display.
 	var logFilePath string
 	if !*noTUI {
-		// through and corrupt the display. Redirect slog to a temp log file so
-		// the user can tail it separately if desired.
 		logFilePath = fmt.Sprintf("%s/gh-tunnel-client.log", os.TempDir())
 		f, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 		if err != nil {
-			// Fall back to discard if we can't open the file.
 			slog.SetDefault(slog.New(slog.NewTextHandler(os.NewFile(0, os.DevNull), nil)))
 			logFilePath = ""
 		} else {
@@ -54,7 +52,6 @@ func main() {
 
 	rl := client.NewRateLimiter(tokenStrings(cfg.GitHub.Tokens), cfg)
 
-	// Build the transport backend per-token.
 	clients := make(map[int]shared.Transport, len(cfg.GitHub.Tokens))
 	for i, tc := range cfg.GitHub.Tokens {
 		transport := tc.Transport
@@ -81,7 +78,7 @@ func main() {
 		slog.Error("mux client init failed", "error", err)
 		os.Exit(1)
 	}
-	socks := client.NewSOCKSServer(cfg.SOCKS.Listen, manager, cfg.SOCKS.Timeout)
+	socks := client.NewSOCKSServer(cfg.SOCKS.Listen, manager, cfg.SOCKS.Timeout, cfg.SOCKS.BufferSize)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

@@ -15,22 +15,18 @@ import (
 // -X github.com/sartoopjj/vpn-over-github/client.Version=x.y.z
 var Version = "dev"
 
-// TokenConfig holds per-token GitHub configuration.
-// Transport defaults to "git" when empty.
-// Repo is required when Transport is "git".
-//
-// BatchInterval and FetchInterval can override the global github.batch_interval
-// and github.fetch_interval for this token only — useful when mixing a fast
-// `git` transport with a rate-limited `gist` transport in the same config.
+// TokenConfig is one entry in github.tokens.
+// BatchInterval, FetchInterval and UpstreamConnections override the
+// corresponding global github.* fields for this token only.
 type TokenConfig struct {
-	Token         string        `yaml:"token"`
-	Transport     string        `yaml:"transport"`
-	Repo          string        `yaml:"repo"`
-	BatchInterval time.Duration `yaml:"batch_interval,omitempty"`
-	FetchInterval time.Duration `yaml:"fetch_interval,omitempty"`
+	Token               string        `yaml:"token"`
+	Transport           string        `yaml:"transport"`
+	Repo                string        `yaml:"repo"`
+	BatchInterval       time.Duration `yaml:"batch_interval,omitempty"`
+	FetchInterval       time.Duration `yaml:"fetch_interval,omitempty"`
+	UpstreamConnections int           `yaml:"upstream_connections,omitempty"`
 }
 
-// EffectiveBatchInterval returns the per-token batch interval if set, else fallback.
 func (tc TokenConfig) EffectiveBatchInterval(fallback time.Duration) time.Duration {
 	if tc.BatchInterval > 0 {
 		return tc.BatchInterval
@@ -38,7 +34,6 @@ func (tc TokenConfig) EffectiveBatchInterval(fallback time.Duration) time.Durati
 	return fallback
 }
 
-// EffectiveFetchInterval returns the per-token fetch interval if set, else fallback.
 func (tc TokenConfig) EffectiveFetchInterval(fallback time.Duration) time.Duration {
 	if tc.FetchInterval > 0 {
 		return tc.FetchInterval
@@ -46,7 +41,6 @@ func (tc TokenConfig) EffectiveFetchInterval(fallback time.Duration) time.Durati
 	return fallback
 }
 
-// EffectiveTransport returns the configured transport, defaulting to "git".
 func (tc TokenConfig) EffectiveTransport() string {
 	if tc.Transport == "" {
 		return "git"
@@ -54,12 +48,20 @@ func (tc TokenConfig) EffectiveTransport() string {
 	return tc.Transport
 }
 
+func (tc TokenConfig) EffectiveUpstreamConnections(fallback int) int {
+	if tc.UpstreamConnections > 0 {
+		return tc.UpstreamConnections
+	}
+	return fallback
+}
+
 // Config holds all client configuration, loaded from YAML file and/or CLI flags.
 // CLI flags always override config file values.
 type Config struct {
 	SOCKS struct {
-		Listen  string        `yaml:"listen_addr"`
-		Timeout time.Duration `yaml:"timeout"`
+		Listen     string        `yaml:"listen_addr"`
+		Timeout    time.Duration `yaml:"timeout"`
+		BufferSize int           `yaml:"buffer_size"`
 	} `yaml:"socks"`
 
 	GitHub struct {
@@ -94,10 +96,11 @@ func DefaultConfig() *Config {
 
 	cfg.SOCKS.Listen = "127.0.0.1:1080"
 	cfg.SOCKS.Timeout = 30 * time.Second
+	cfg.SOCKS.BufferSize = 1 << 20 // 1 MiB
 
-	cfg.GitHub.UpstreamConnections = 2
-	cfg.GitHub.BatchInterval = 100 * time.Millisecond
-	cfg.GitHub.FetchInterval = 200 * time.Millisecond
+	cfg.GitHub.UpstreamConnections = 1
+	cfg.GitHub.BatchInterval = 500 * time.Millisecond
+	cfg.GitHub.FetchInterval = 1000 * time.Millisecond
 	cfg.GitHub.APITimeout = 10 * time.Second
 
 	cfg.Encryption.Algorithm = "xor"
@@ -212,6 +215,9 @@ func validateClientConfig(cfg *Config) error {
 	if cfg.SOCKS.Listen == "" {
 		return fmt.Errorf("socks.listen is required (e.g., '127.0.0.1:1080')")
 	}
+	if cfg.SOCKS.BufferSize <= 0 {
+		cfg.SOCKS.BufferSize = 1 << 20 // 1 MiB
+	}
 	switch cfg.Encryption.Algorithm {
 	case "xor", "aes":
 		// valid
@@ -225,13 +231,13 @@ func validateClientConfig(cfg *Config) error {
 		return fmt.Errorf("rate_limit.low_remaining_warn must be >= 1, got %d", cfg.RateLimit.LowRemainingWarn)
 	}
 	if cfg.GitHub.UpstreamConnections <= 0 {
-		cfg.GitHub.UpstreamConnections = 2
+		cfg.GitHub.UpstreamConnections = 1
 	}
 	if cfg.GitHub.BatchInterval <= 0 {
-		cfg.GitHub.BatchInterval = 100 * time.Millisecond
+		cfg.GitHub.BatchInterval = 500 * time.Millisecond
 	}
 	if cfg.GitHub.FetchInterval <= 0 {
-		cfg.GitHub.FetchInterval = 200 * time.Millisecond
+		cfg.GitHub.FetchInterval = 1000 * time.Millisecond
 	}
 	if cfg.GitHub.APITimeout <= 0 {
 		cfg.GitHub.APITimeout = 10 * time.Second

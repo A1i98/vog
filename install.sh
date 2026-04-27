@@ -129,12 +129,26 @@ configure() {
     read -r -p "Encryption algorithm [xor/aes] (default: xor): " ALGO
     ALGO="${ALGO:-xor}"
 
-    read -r -p "Fetch interval in ms [default: 200]: " FETCH_MS
-    FETCH_MS="${FETCH_MS:-200}"
+    # Per-transport defaults that respect GitHub rate limits:
+    #   git : no REST quota; 500 ms keeps each push completing in time.
+    #   gist: 500 writes/hr/account secondary cap → batch ≥ 8 s.
+    if [ "${TRANSPORT}" = "gist" ]; then
+        DEFAULT_BATCH_MS=8000
+        DEFAULT_FETCH_MS=1000
+    else
+        DEFAULT_BATCH_MS=500
+        DEFAULT_FETCH_MS=1000
+    fi
+
+    read -r -p "Batch interval in ms [default: ${DEFAULT_BATCH_MS}]: " BATCH_MS
+    BATCH_MS="${BATCH_MS:-${DEFAULT_BATCH_MS}}"
+
+    read -r -p "Fetch interval in ms [default: ${DEFAULT_FETCH_MS}]: " FETCH_MS
+    FETCH_MS="${FETCH_MS:-${DEFAULT_FETCH_MS}}"
 
     # shellcheck disable=SC2059
-    printf "github:\n  tokens:\n    - token: \"%s\"\n      transport: \"%s\"%b\n  upstream_connections: 2\n  batch_interval: 100ms\n  fetch_interval: %sms\n  api_timeout: 10s\n\ncleanup:\n  enabled: true\n  interval: 10m\n  dead_connection_ttl: 15m\n\nproxy:\n  target_timeout: 30s\n  buffer_size: 65536\n\nencryption:\n  algorithm: %s\n\nlogging:\n  level: info\n  format: text\n" \
-        "${TOKEN}" "${TRANSPORT}" "${REPO_LINE}" "${FETCH_MS}" "${ALGO}" > "${CONFIG_FILE}"
+    printf "github:\n  tokens:\n    - token: \"%s\"\n      transport: \"%s\"%b\n      batch_interval: %sms\n      fetch_interval: %sms\n  upstream_connections: 1\n  batch_interval: %sms\n  fetch_interval: %sms\n  api_timeout: 10s\n\ncleanup:\n  enabled: true\n  interval: 10m\n  dead_connection_ttl: 15m\n\nproxy:\n  target_timeout: 30s\n  buffer_size: 2097152\n\nencryption:\n  algorithm: %s\n\nlogging:\n  level: info\n  format: text\n" \
+        "${TOKEN}" "${TRANSPORT}" "${REPO_LINE}" "${BATCH_MS}" "${FETCH_MS}" "${BATCH_MS}" "${FETCH_MS}" "${ALGO}" > "${CONFIG_FILE}"
     chmod 600 "${CONFIG_FILE}"
     log "Config written to ${CONFIG_FILE} (permissions: 600)"
 }

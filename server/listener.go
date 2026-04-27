@@ -9,20 +9,16 @@ import (
 	"github.com/sartoopjj/vpn-over-github/shared"
 )
 
-// ChannelListener discovers channels and starts a handler for each one.
-//
-// Each token's transport is scanned at its own scan interval — the gist
-// transport burns a REST quota slot per non-cached scan, so it must scan
-// slowly; the git transport reads the local working tree, so it can scan
-// fast for free.
+// ChannelListener discovers channels per-token and starts a handler for each.
+// Gist scans clamp to ≥2s (REST quota); git scans run at the fetch interval.
 type ChannelListener struct {
 	cfg        *ServerConfig
 	transports map[int]shared.Transport
 	tokens     []TokenConfig
 
 	mu       sync.Mutex
-	handlers map[string]context.CancelFunc // channelID -> cancel
-	owner    map[string]int                // channelID -> tokenIdx
+	handlers map[string]context.CancelFunc
+	owner    map[string]int
 }
 
 func NewChannelListener(cfg *ServerConfig, transports map[int]shared.Transport, tokens []TokenConfig) *ChannelListener {
@@ -35,11 +31,6 @@ func NewChannelListener(cfg *ServerConfig, transports map[int]shared.Transport, 
 	}
 }
 
-// scanInterval picks a sane per-token scan interval based on the transport.
-//   - gist: clamp to ≥2s. Each ListChannels burns one REST quota slot when
-//     the result changes; ETag caches the unchanged case as 304 (free).
-//   - git:  local-only readdir, so it can run as fast as the fetch interval
-//     (with a 200ms floor to avoid spinning).
 func (l *ChannelListener) scanInterval(tokenIdx int) time.Duration {
 	transport := "git"
 	tokenFetch := l.cfg.GitHub.FetchInterval
@@ -114,7 +105,8 @@ func (l *ChannelListener) transportKind(tokenIdx int) string {
 	return l.tokens[tokenIdx].EffectiveTransport()
 }
 
-// scanOne reconciles handlers for a single token's transport.
+// scanOne reconciles handlers for one token's listing. It only stops handlers
+// it owns so per-token scans don't fight each other.
 func (l *ChannelListener) scanOne(ctx context.Context, tokenIdx int, transport shared.Transport) {
 	channels, err := transport.ListChannels(ctx)
 	if err != nil {
@@ -128,9 +120,6 @@ func (l *ChannelListener) scanOne(ctx context.Context, tokenIdx int, transport s
 		l.startHandler(ctx, tokenIdx, ch.ID, transport)
 	}
 
-	// Stop handlers for channels that disappeared from THIS token's listing —
-	// only ones we previously associated with this token, so per-token scans
-	// don't fight each other.
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for channelID, owner := range l.owner {

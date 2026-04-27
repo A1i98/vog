@@ -1,19 +1,19 @@
 github:
   tokens:
-    - token: "ghp_your_server_token_here"
-      transport: "gist"
-      batch_interval: 500ms
-      fetch_interval: 500ms
-
     - token: "ghp_your_other_server_token_here"
       transport: "git"
       repo: "yourname/your-private-tunnel-repo"
-      batch_interval: 100ms
-      fetch_interval: 200ms
+      batch_interval: 500ms
+      fetch_interval: 1000ms
+
+    # - token: "ghp_your_server_token_here"
+    #   transport: "gist"
+    #   batch_interval: 8000ms
+    #   fetch_interval: 1000ms
 
   upstream_connections: 1
-  batch_interval: 100ms
-  fetch_interval: 200ms
+  batch_interval: 500ms
+  fetch_interval: 1000ms
   api_timeout: 10s
 
 cleanup:
@@ -23,7 +23,9 @@ cleanup:
 
 proxy:
   target_timeout: 30s
-  buffer_size: 65536
+  # Max bytes per Read from the upstream destination → one frame.
+  # Bump (1-2 MiB) for video / large downloads.
+  buffer_size: 2097152
 
 encryption:
   algorithm: "xor"

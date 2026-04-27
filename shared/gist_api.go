@@ -206,15 +206,16 @@ func (c *GitHubGistClient) ListChannels(ctx context.Context) ([]*ChannelInfo, er
 	return channels, nil
 }
 
-// Write serialises batch to JSON and patches channelID/filename in the gist.
+// Write serialises batch (gzip when worthwhile) and patches channelID/filename
+// in the gist.
 func (c *GitHubGistClient) Write(ctx context.Context, channelID, filename string, batch *Batch) error {
-	content, err := json.Marshal(batch)
+	content, err := EncodeBatchString(batch)
 	if err != nil {
-		return fmt.Errorf("Write marshal: %w", err)
+		return fmt.Errorf("Write encode: %w", err)
 	}
 	body := map[string]interface{}{
 		"files": map[string]map[string]string{
-			filename: {"content": string(content)},
+			filename: {"content": content},
 		},
 	}
 	resp, err := c.doRequest(ctx, http.MethodPatch, "/gists/"+channelID, body, "")
@@ -283,16 +284,16 @@ func (c *GitHubGistClient) Read(ctx context.Context, channelID, filename string)
 		return nil, nil
 	}
 
-	var batch Batch
-	if err := json.Unmarshal([]byte(f.Content), &batch); err != nil {
+	batch, err := DecodeBatchString(f.Content)
+	if err != nil {
 		return nil, fmt.Errorf("Read %s/%s parse batch: %w", channelID, filename, err)
 	}
 
 	etag := resp.Header.Get("ETag")
 	c.mu.Lock()
-	c.readCache[cacheKey] = &readCacheEntry{etag: etag, batch: &batch}
+	c.readCache[cacheKey] = &readCacheEntry{etag: etag, batch: batch}
 	c.mu.Unlock()
-	return &batch, nil
+	return batch, nil
 }
 
 func (c *GitHubGistClient) GetRateLimitInfo() RateLimitInfo {

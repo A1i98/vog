@@ -197,6 +197,54 @@ func TestClient_GarbageCollectsClosedConn(t *testing.T) {
 	t.Fatalf("conn was not GC'd after Close; still %d active", len(mux.Snapshot()))
 }
 
+// TestClient_CoalescesMultipleWritesIntoOneFrame — burst of small Writes
+// in the same flush window should ship as ONE frame, not N.
+func TestClient_CoalescesMultipleWritesIntoOneFrame(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	cfg := newClientCfg()
+	cfg.GitHub.BatchInterval = 200 * time.Millisecond
+	cfg.GitHub.FetchInterval = 200 * time.Millisecond
+	rl := client.NewRateLimiter([]string{"ghp_test_token"}, cfg)
+	transport := mocks.NewMockTransport()
+	mux, err := client.NewMuxClient(ctx, cfg, rl, map[int]shared.Transport{0: transport})
+	if err != nil {
+		t.Fatalf("NewMuxClient: %v", err)
+	}
+	defer mux.CloseAll(context.Background())
+
+	vc, err := mux.Connect(ctx, "10.10.10.10:9999")
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	for _, p := range []string{"hel", "lo, ", "world"} {
+		if _, err := vc.Write([]byte(p)); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+
+	b := readClientBatch(t, ctx, transport, "ch-1", 1*time.Second)
+	if b == nil {
+		t.Fatal("no client batch written")
+	}
+	if len(b.Frames) != 1 {
+		t.Fatalf("expected 1 coalesced frame, got %d: %+v", len(b.Frames), b.Frames)
+	}
+	f := b.Frames[0]
+	if f.Dst != "10.10.10.10:9999" {
+		t.Fatalf("frame missing Dst: %+v", f)
+	}
+	enc := shared.NewEncryptor(shared.AlgorithmXOR, "ghp_test_token")
+	plain, err := enc.Decrypt(f.Data, f.ConnID, f.Seq)
+	if err != nil {
+		t.Fatalf("decrypt: %v", err)
+	}
+	if string(plain) != "hello, world" {
+		t.Fatalf("decrypted %q want %q", plain, "hello, world")
+	}
+}
+
 // TestClient_DoesNotEmitOpenForOpenedThenClosedConn — Connect followed by
 // Close before the first flush should drop the conn entirely without sending
 // any frame: server never knew about it, no cleanup needed.

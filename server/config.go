@@ -10,14 +10,14 @@ import (
 )
 
 type TokenConfig struct {
-	Token         string        `yaml:"token"`
-	Transport     string        `yaml:"transport"`
-	Repo          string        `yaml:"repo"`
-	BatchInterval time.Duration `yaml:"batch_interval,omitempty"`
-	FetchInterval time.Duration `yaml:"fetch_interval,omitempty"`
+	Token               string        `yaml:"token"`
+	Transport           string        `yaml:"transport"`
+	Repo                string        `yaml:"repo"`
+	BatchInterval       time.Duration `yaml:"batch_interval,omitempty"`
+	FetchInterval       time.Duration `yaml:"fetch_interval,omitempty"`
+	UpstreamConnections int           `yaml:"upstream_connections,omitempty"`
 }
 
-// EffectiveBatchInterval returns the per-token batch interval if set, else fallback.
 func (tc TokenConfig) EffectiveBatchInterval(fallback time.Duration) time.Duration {
 	if tc.BatchInterval > 0 {
 		return tc.BatchInterval
@@ -25,7 +25,6 @@ func (tc TokenConfig) EffectiveBatchInterval(fallback time.Duration) time.Durati
 	return fallback
 }
 
-// EffectiveFetchInterval returns the per-token fetch interval if set, else fallback.
 func (tc TokenConfig) EffectiveFetchInterval(fallback time.Duration) time.Duration {
 	if tc.FetchInterval > 0 {
 		return tc.FetchInterval
@@ -33,12 +32,18 @@ func (tc TokenConfig) EffectiveFetchInterval(fallback time.Duration) time.Durati
 	return fallback
 }
 
-// EffectiveTransport returns the configured transport, defaulting to "git".
 func (tc TokenConfig) EffectiveTransport() string {
 	if tc.Transport == "" {
 		return "git"
 	}
 	return tc.Transport
+}
+
+func (tc TokenConfig) EffectiveUpstreamConnections(fallback int) int {
+	if tc.UpstreamConnections > 0 {
+		return tc.UpstreamConnections
+	}
+	return fallback
 }
 
 // ServerConfig holds all server configuration.
@@ -80,10 +85,10 @@ func DefaultServerConfig() *ServerConfig {
 	cfg.Cleanup.Interval = 10 * time.Minute
 	cfg.Cleanup.DeadConnectionTTL = 15 * time.Minute
 	cfg.Proxy.TargetTimeout = 30 * time.Second
-	cfg.Proxy.BufferSize = 65536
-	cfg.GitHub.UpstreamConnections = 2
-	cfg.GitHub.BatchInterval = 100 * time.Millisecond
-	cfg.GitHub.FetchInterval = 200 * time.Millisecond
+	cfg.Proxy.BufferSize = 2 << 20 // 2 MiB
+	cfg.GitHub.UpstreamConnections = 1
+	cfg.GitHub.BatchInterval = 500 * time.Millisecond
+	cfg.GitHub.FetchInterval = 1000 * time.Millisecond
 	cfg.GitHub.APITimeout = 10 * time.Second
 	cfg.Encryption.Algorithm = "xor"
 	cfg.Logging.Level = "info"
@@ -139,16 +144,16 @@ func validateServerConfig(cfg *ServerConfig) error {
 	}
 	cfg.Encryption.Algorithm = algo
 	if cfg.GitHub.UpstreamConnections <= 0 {
-		cfg.GitHub.UpstreamConnections = 2
+		cfg.GitHub.UpstreamConnections = 1
 	}
 	if cfg.GitHub.BatchInterval <= 0 {
-		cfg.GitHub.BatchInterval = 100 * time.Millisecond
+		cfg.GitHub.BatchInterval = 500 * time.Millisecond
 	}
 	if cfg.GitHub.FetchInterval <= 0 {
-		cfg.GitHub.FetchInterval = 200 * time.Millisecond
+		cfg.GitHub.FetchInterval = 1000 * time.Millisecond
 	}
 	if cfg.Proxy.BufferSize <= 0 {
-		cfg.Proxy.BufferSize = 65536
+		cfg.Proxy.BufferSize = 2 << 20 // 2 MiB
 	}
 	if cfg.Cleanup.Interval <= 0 {
 		cfg.Cleanup.Interval = 10 * time.Minute

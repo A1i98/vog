@@ -80,7 +80,12 @@ func (m *MockTransport) Write(_ context.Context, channelID, filename string, bat
 	if !ok {
 		return shared.ErrNotFound
 	}
-	copied := &shared.Batch{Seq: batch.Seq, Ts: batch.Ts, Frames: append([]shared.Frame(nil), batch.Frames...)}
+	copied := &shared.Batch{
+		Epoch:  batch.Epoch,
+		Seq:    batch.Seq,
+		Ts:     batch.Ts,
+		Frames: append([]shared.Frame(nil), batch.Frames...),
+	}
 	ch.batches[filename] = copied
 	ch.updatedAt = time.Now()
 	return nil
@@ -100,7 +105,12 @@ func (m *MockTransport) Read(_ context.Context, channelID, filename string) (*sh
 	if batch == nil {
 		return nil, nil
 	}
-	copied := &shared.Batch{Seq: batch.Seq, Ts: batch.Ts, Frames: append([]shared.Frame(nil), batch.Frames...)}
+	copied := &shared.Batch{
+		Epoch:  batch.Epoch,
+		Seq:    batch.Seq,
+		Ts:     batch.Ts,
+		Frames: append([]shared.Frame(nil), batch.Frames...),
+	}
 	return copied, nil
 }
 

@@ -42,7 +42,6 @@ func main() {
 		"encryption", cfg.Encryption.Algorithm,
 	)
 
-	// Build the transport backend per-token.
 	clients := make(map[int]shared.Transport, len(cfg.GitHub.Tokens))
 	for i, tc := range cfg.GitHub.Tokens {
 		transport := tc.Transport

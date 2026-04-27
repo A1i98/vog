@@ -3,14 +3,9 @@ package shared
 import "time"
 
 const (
-	// ChannelDescPrefix is the gist description prefix used to identify tunnel channels.
 	ChannelDescPrefix = "gist-tunnel-ch"
-	// ClientBatchFile is the file written by the client side of a channel.
-	ClientBatchFile = "client.json"
-	// ServerBatchFile is the file written by the server side of a channel.
-	ServerBatchFile = "server.json"
-	// MaxFrameDataSize is the max plaintext bytes per frame.
-	MaxFrameDataSize = 512 * 1024
+	ClientBatchFile   = "client.json"
+	ServerBatchFile   = "server.json"
 )
 
 // FrameStatus is the state of a virtual connection within the mux.
@@ -33,17 +28,9 @@ type Frame struct {
 	Error  string      `json:"err,omitempty"`
 }
 
-// Batch is the top-level object written to a channel file.
-//
-// Each writer side picks a random Epoch at startup and increments Seq
-// monotonically within that epoch. A reader treats a batch as new if
-// either:
-//   - its Epoch differs from the last accepted Epoch (writer restart), or
-//   - its Epoch matches and Seq > last accepted Seq.
-//
-// This is robust to writer restarts that reset Seq back to 1 — the old
-// `(seq, ts)` heuristic accepted such resets only opportunistically and
-// could either drop or duplicate frames.
+// Batch is what each side writes to its channel file. The writer picks a
+// random Epoch at startup and increments Seq monotonically within that
+// epoch; readers accept a batch when (epoch != last) || (seq > last).
 type Batch struct {
 	Epoch  int64   `json:"epoch,omitempty"`
 	Seq    int64   `json:"seq"`
@@ -83,7 +70,7 @@ func MaskToken(token string) string {
 	return token[:4] + "****" + token[len(token)-4:]
 }
 
-// BatchAge returns the age of a batch in seconds based on its Ts field.
+// Age returns time.Since(batch.Ts).
 func (b *Batch) Age() time.Duration {
 	if b == nil || b.Ts == 0 {
 		return 0

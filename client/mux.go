@@ -15,37 +15,27 @@ import (
 	"github.com/sartoopjj/vpn-over-github/shared"
 )
 
-// upstreamChannel holds the state for one pre-allocated channel (gist or git dir).
-//
-// Each upstream channel carries its own writer goroutine (batchWriteLoop) and
-// reader goroutine (batchReadLoop). The writer is woken either by a periodic
-// ticker or by an on-demand flush signal — VirtualConns ping flushSig from
-// Connect / Write / Close so that interactive traffic doesn't have to wait
-// the full BatchInterval.
+// upstreamChannel is one pre-allocated channel (gist or git dir) with its
+// own writer + reader goroutines. flushSig wakes the writer between ticks.
 type upstreamChannel struct {
 	channelID string
 	tokenIdx  int
 	transport shared.Transport
 	encryptor *shared.Encryptor
 
-	transportKind string // "gist" or "git"
+	transportKind string
 	batchInterval time.Duration
 	fetchInterval time.Duration
 
-	// epoch is randomized at startup; reader side resets dedup on epoch change.
 	epoch    int64
 	batchSeq atomic.Int64
 
-	// dedup state for the server-written batch we read.
 	lastReadEpoch atomic.Int64
 	lastReadSeq   atomic.Int64
 
-	// flushSig is a 1-buffered chan; signalFlush() pings without blocking.
 	flushSig chan struct{}
 }
 
-// signalFlush pings the writer loop to flush as soon as the coalescing window
-// allows. It never blocks.
 func (ch *upstreamChannel) signalFlush() {
 	select {
 	case ch.flushSig <- struct{}{}:
@@ -58,12 +48,11 @@ type VirtualConn struct {
 	connID    string
 	dst       string
 	channel   *upstreamChannel
+	mux       *MuxClient
 	recvBuf   chan []byte
 	closed    chan struct{}
 	closeOnce sync.Once
 
-	// openSent flips to true once the OPEN frame has been emitted on the wire.
-	// closeSent flips when the FrameClosing frame has been emitted.
 	openSent  atomic.Bool
 	closeSent atomic.Bool
 
@@ -82,7 +71,6 @@ type writeChunk struct {
 	seq  int64
 }
 
-// Write enqueues data to be sent to the server in the next batch.
 func (vc *VirtualConn) Write(p []byte) (int, error) {
 	select {
 	case <-vc.closed:
@@ -96,13 +84,15 @@ func (vc *VirtualConn) Write(p []byte) (int, error) {
 	vc.writeQueue = append(vc.writeQueue, writeChunk{data: buf, seq: seq})
 	vc.mu.Unlock()
 	vc.bytesUp.Add(int64(len(p)))
+	if vc.mux != nil {
+		vc.mux.totalBytesUp.Add(int64(len(p)))
+	}
 	if vc.channel != nil {
 		vc.channel.signalFlush()
 	}
 	return len(p), nil
 }
 
-// Read blocks until data is received from the server.
 func (vc *VirtualConn) Read(p []byte) (int, error) {
 	vc.mu.Lock()
 	if len(vc.readBuf) > 0 {
@@ -110,6 +100,9 @@ func (vc *VirtualConn) Read(p []byte) (int, error) {
 		vc.readBuf = vc.readBuf[n:]
 		vc.mu.Unlock()
 		vc.bytesDown.Add(int64(n))
+		if vc.mux != nil {
+			vc.mux.totalBytesDown.Add(int64(n))
+		}
 		return n, nil
 	}
 	vc.mu.Unlock()
@@ -126,14 +119,15 @@ func (vc *VirtualConn) Read(p []byte) (int, error) {
 			vc.mu.Unlock()
 		}
 		vc.bytesDown.Add(int64(n))
+		if vc.mux != nil {
+			vc.mux.totalBytesDown.Add(int64(n))
+		}
 		return n, nil
 	case <-vc.closed:
 		return 0, io.EOF
 	}
 }
 
-// Close signals the connection closed. The next batch flush will emit a
-// FrameClosing frame so the server can release the upstream destination.
 func (vc *VirtualConn) Close() error {
 	vc.closeOnce.Do(func() {
 		close(vc.closed)
@@ -144,24 +138,33 @@ func (vc *VirtualConn) Close() error {
 	return nil
 }
 
-// MuxClient manages N upstream channels per token, multiplexing all SOCKS
-// connections through them using batched frames.
+// MuxClient multiplexes all SOCKS connections through one or more upstream
+// channels (one per token, configurable count). Round-robin assigns each
+// new VirtualConn to a channel.
 type MuxClient struct {
 	cfg         *Config
 	rateLimiter *RateLimiter
 	channels    []*upstreamChannel
 
 	mu          sync.RWMutex
-	conns       map[string]*VirtualConn // connID → VirtualConn
-	nextChannel uint64                  // round-robin index (atomic via mu)
+	conns       map[string]*VirtualConn
+	nextChannel uint64
+
+	// Lifetime counters: monotonically increasing across the whole client
+	// run, including bytes from conns that have already been GC'd.
+	totalBytesUp   atomic.Int64
+	totalBytesDown atomic.Int64
 }
 
-// NewMuxClient creates and starts a MuxClient. It pre-allocates N channels
-// per token using EnsureChannel.
+// TotalBytes returns cumulative tunneled bytes since startup.
+func (m *MuxClient) TotalBytes() (up, down int64) {
+	return m.totalBytesUp.Load(), m.totalBytesDown.Load()
+}
+
 func NewMuxClient(ctx context.Context, cfg *Config, rl *RateLimiter, transports map[int]shared.Transport) (*MuxClient, error) {
-	n := cfg.GitHub.UpstreamConnections
-	if n <= 0 {
-		n = 2
+	defaultN := cfg.GitHub.UpstreamConnections
+	if defaultN <= 0 {
+		defaultN = 2
 	}
 
 	m := &MuxClient{
@@ -178,6 +181,10 @@ func NewMuxClient(ctx context.Context, cfg *Config, rl *RateLimiter, transports 
 		wg.Add(1)
 		go func(tokenIdx int, transport shared.Transport) {
 			defer wg.Done()
+			n := defaultN
+			if tokenIdx < len(cfg.GitHub.Tokens) {
+				n = cfg.GitHub.Tokens[tokenIdx].EffectiveUpstreamConnections(defaultN)
+			}
 			channels, err := m.initTokenChannels(ctx, tokenIdx, transport, n)
 			initMu.Lock()
 			defer initMu.Unlock()
@@ -207,9 +214,8 @@ func NewMuxClient(ctx context.Context, cfg *Config, rl *RateLimiter, transports 
 	return m, nil
 }
 
-// Connect opens a new virtual connection to dst. Returns a VirtualConn that
-// implements io.ReadWriteCloser. The OPEN frame is sent on the next flush
-// (which is signalled immediately, not waited for).
+// Connect opens a new virtual connection to dst. The OPEN frame is sent on
+// the next flush (signalled immediately).
 func (m *MuxClient) Connect(_ context.Context, dst string) (*VirtualConn, error) {
 	connID, err := shared.GenerateConnID()
 	if err != nil {
@@ -224,6 +230,7 @@ func (m *MuxClient) Connect(_ context.Context, dst string) (*VirtualConn, error)
 		connID:    connID,
 		dst:       dst,
 		channel:   ch,
+		mux:       m,
 		recvBuf:   make(chan []byte, 256),
 		closed:    make(chan struct{}),
 		startTime: time.Now(),
@@ -231,22 +238,16 @@ func (m *MuxClient) Connect(_ context.Context, dst string) (*VirtualConn, error)
 	m.conns[connID] = vc
 	m.mu.Unlock()
 
-	// Wake the writer immediately so the OPEN frame goes out within
-	// the coalescing window (≈ batchInterval / 4) instead of waiting a
-	// full ticker period.
 	ch.signalFlush()
-
 	slog.Info("virtual connection opened", "conn_id", connID, "dst", dst, "channel", ch.channelID)
 	return vc, nil
 }
 
-// CloseConn marks vc as closed. The actual FrameClosing frame is emitted on
-// the next batch flush.
 func (m *MuxClient) CloseConn(_ context.Context, vc *VirtualConn) {
 	_ = vc.Close()
 }
 
-// CloseAll closes all connections and deletes upstream channels.
+// CloseAll closes every conn and deletes the channels it owns.
 func (m *MuxClient) CloseAll(ctx context.Context) {
 	m.mu.Lock()
 	conns := make([]*VirtualConn, 0, len(m.conns))
@@ -299,14 +300,9 @@ func (m *MuxClient) Snapshot() []ConnSnapshot {
 	return out
 }
 
-// ── batch loops ────────────────────────────────────────────────────────────
-
-// batchWriteLoop drives the write side of one upstream channel.
-//
-// The timer is single-shot and reset to batchInterval after every flush.
-// flushSig may shorten the timer (down to fastFlushGap) so that interactive
-// connect/write events don't wait a full tick. flushSig is bounded so a
-// busy connection cannot trigger more than ~1 flush per fastFlushGap.
+// batchWriteLoop drives one upstream channel's writer. Single-shot timer
+// reset to batchInterval after each flush; flushSig may shorten it down
+// to fastFlushGap (= batchInterval/4) for interactive responsiveness.
 func (m *MuxClient) batchWriteLoop(ctx context.Context, ch *upstreamChannel) {
 	batchInterval := ch.batchInterval
 	if batchInterval <= 0 {
@@ -384,26 +380,22 @@ func (m *MuxClient) flushOutbound(ctx context.Context, ch *upstreamChannel) {
 
 		needsOpen := !vc.openSent.Load()
 
-		// Already-closed conn that never opened: just drop it. The server
-		// never knew about this conn so no cleanup frame is needed.
+		// closed-before-open: server never knew about it, drop silently.
 		if needsOpen && len(queue) == 0 && isClosed {
 			toDelete = append(toDelete, vc.connID)
 			continue
 		}
-
-		// Already-closed and we already sent the close frame previously:
-		// final GC pass.
+		// close already flushed: final GC pass.
 		if isClosed && vc.closeSent.Load() {
 			toDelete = append(toDelete, vc.connID)
 			continue
 		}
-
-		// Nothing to send and not closed and OPEN already sent: skip.
+		// nothing to do.
 		if !needsOpen && len(queue) == 0 && !isClosed {
 			continue
 		}
 
-		// Bare-OPEN case: we need to send OPEN but have no data yet.
+		// bare OPEN (server-speaks-first protocols).
 		if needsOpen && len(queue) == 0 {
 			seq := vc.seq.Add(1)
 			status := shared.FrameActive
@@ -422,58 +414,56 @@ func (m *MuxClient) flushOutbound(ctx context.Context, ch *upstreamChannel) {
 			continue
 		}
 
-		// We have data (and possibly close). The OPEN is piggybacked onto
-		// the first frame that ACTUALLY goes out — not blindly onto the
-		// first iteration — so an encrypt failure on chunk[0] doesn't
-		// leave the server with a data frame for an unknown conn.
-		// Same logic for FrameClosing: the close marker only applies if
-		// the close-bearing chunk was successfully appended.
-		for i, chunk := range queue {
-			isLast := i == len(queue)-1
-			encoded := ""
+		// Coalesce all chunks into one frame (highest seq, concatenated data).
+		var merged []byte
+		var maxSeq int64
+		for _, chunk := range queue {
 			if len(chunk.data) > 0 {
-				enc, err := ch.encryptor.Encrypt(chunk.data, vc.connID, chunk.seq)
-				if err != nil {
-					slog.Warn("encrypt failed", "conn_id", vc.connID, "error", err)
-					continue
-				}
-				encoded = enc
+				merged = append(merged, chunk.data...)
 			}
-			dst := ""
-			if needsOpen {
-				dst = vc.dst
-			}
-			status := shared.FrameActive
-			closingHere := isClosed && isLast
-			if closingHere {
-				status = shared.FrameClosing
-			}
-			frames = append(frames, shared.Frame{
-				ConnID: vc.connID,
-				Seq:    chunk.seq,
-				Dst:    dst,
-				Data:   encoded,
-				Status: status,
-			})
-			if needsOpen {
-				vc.openSent.Store(true)
-				needsOpen = false
-			}
-			if closingHere {
-				vc.closeSent.Store(true)
-				toDelete = append(toDelete, vc.connID)
+			if chunk.seq > maxSeq {
+				maxSeq = chunk.seq
 			}
 		}
 
-		// Defensive: if we processed all chunks but the conn is closed and we
-		// somehow didn't tag any of them as Closing (e.g., all encrypts failed),
-		// emit an explicit close frame.
-		if isClosed && !vc.closeSent.Load() {
-			frames = append(frames, shared.Frame{
-				ConnID: vc.connID,
-				Seq:    vc.seq.Add(1),
-				Status: shared.FrameClosing,
-			})
+		encoded := ""
+		if len(merged) > 0 {
+			enc, err := ch.encryptor.Encrypt(merged, vc.connID, maxSeq)
+			if err != nil {
+				slog.Warn("encrypt failed", "conn_id", vc.connID, "error", err)
+				if isClosed {
+					frames = append(frames, shared.Frame{
+						ConnID: vc.connID,
+						Seq:    vc.seq.Add(1),
+						Status: shared.FrameClosing,
+					})
+					vc.closeSent.Store(true)
+					toDelete = append(toDelete, vc.connID)
+				}
+				continue
+			}
+			encoded = enc
+		}
+
+		status := shared.FrameActive
+		if isClosed {
+			status = shared.FrameClosing
+		}
+		dst := ""
+		if needsOpen {
+			dst = vc.dst
+		}
+		frames = append(frames, shared.Frame{
+			ConnID: vc.connID,
+			Seq:    maxSeq,
+			Dst:    dst,
+			Data:   encoded,
+			Status: status,
+		})
+		if needsOpen {
+			vc.openSent.Store(true)
+		}
+		if isClosed {
 			vc.closeSent.Store(true)
 			toDelete = append(toDelete, vc.connID)
 		}
@@ -503,10 +493,7 @@ func (m *MuxClient) flushOutbound(ctx context.Context, ch *upstreamChannel) {
 
 	m.afterTransportCall(ch.tokenIdx, ch.transport)
 
-	// RecordWrite is only meaningful for the gist transport, which has the
-	// 80/min and 500/hr secondary write quotas. The git transport has no
-	// equivalent quota, so applying these counters there is wrong (it makes
-	// the writer go silent for an hour after 500 batches).
+	// Write quotas only apply to gist; git has no equivalent cap.
 	if ch.transportKind == "gist" {
 		if wait := m.rateLimiter.RecordWrite(ch.tokenIdx); wait > 0 {
 			select {
@@ -519,7 +506,6 @@ func (m *MuxClient) flushOutbound(ctx context.Context, ch *upstreamChannel) {
 	m.gcConns(toDelete)
 }
 
-// gcConns removes the given conn IDs from the active map.
 func (m *MuxClient) gcConns(ids []string) {
 	if len(ids) == 0 {
 		return
@@ -531,10 +517,7 @@ func (m *MuxClient) gcConns(ids []string) {
 	m.mu.Unlock()
 }
 
-// batchReadLoop polls the server-written file for new batches.
-//
-// When no virtual connections are bound to this channel, the loop backs off
-// to a longer interval so idle channels don't burn rate-limit quota.
+// batchReadLoop polls server.json for new batches; backs off when idle.
 func (m *MuxClient) batchReadLoop(ctx context.Context, ch *upstreamChannel) {
 	fetchInterval := ch.fetchInterval
 	if fetchInterval <= 0 {
@@ -592,8 +575,6 @@ func (m *MuxClient) doBatchRead(ctx context.Context, ch *upstreamChannel) {
 		return
 	}
 
-	// Epoch-aware dedup. If the server restarted (new epoch), reset our
-	// view; otherwise require strictly-increasing Seq.
 	lastEpoch := ch.lastReadEpoch.Load()
 	lastSeq := ch.lastReadSeq.Load()
 	if batch.Epoch != lastEpoch {
@@ -610,19 +591,10 @@ func (m *MuxClient) doBatchRead(ctx context.Context, ch *upstreamChannel) {
 	m.dispatchFrames(ch, batch.Frames)
 }
 
-// dispatchFrames hands each server frame to its VirtualConn.
-//
-// Locking discipline:
-//   - m.mu.RLock is held only for the conn-map lookup. The blocking deliver
-//     to vc.recvBuf happens with NO mux-wide lock held, so a slow consumer
-//     can't freeze Connect / CloseAll / dispatch on other conns.
-//   - We block on vc.recvBuf (rather than spawning a per-frame goroutine
-//     under back-pressure) because Go does not guarantee FIFO scheduling
-//     between multiple goroutines simultaneously waiting to send on the
-//     same channel — using the runtime's blocking-send queue is the only
-//     simple way to preserve per-conn frame ordering. With a generous
-//     vc.recvBuf capacity and TCP's natural back-pressure on the SOCKS
-//     side, blocking should be rare in practice.
+// dispatchFrames hands each server frame to its VirtualConn. The conn-map
+// RLock is dropped before delivery so a slow consumer can't freeze Connect
+// or CloseAll. We block on vc.recvBuf rather than spawning per-frame
+// goroutines so per-conn frame ordering is preserved.
 func (m *MuxClient) dispatchFrames(ch *upstreamChannel, frames []shared.Frame) {
 	for _, f := range frames {
 		m.mu.RLock()
@@ -638,9 +610,7 @@ func (m *MuxClient) dispatchFrames(ch *upstreamChannel, frames []shared.Frame) {
 				slog.Info("server reported error for conn", "conn_id", f.ConnID, "error", f.Error)
 			}
 			vc.closeOnce.Do(func() { close(vc.closed) })
-			// Suppress the redundant client-side FrameClosing that would
-			// otherwise be emitted on the next flush — the server has
-			// already torn down its destConn.
+			// server already tore down — don't echo a Closing.
 			vc.closeSent.Store(true)
 			continue
 		}
@@ -663,8 +633,6 @@ func (m *MuxClient) dispatchFrames(ch *upstreamChannel, frames []shared.Frame) {
 		}
 	}
 }
-
-// ── helpers ────────────────────────────────────────────────────────────────
 
 func (m *MuxClient) initTokenChannels(ctx context.Context, tokenIdx int, transport shared.Transport, count int) ([]*upstreamChannel, error) {
 	token := m.rateLimiter.GetToken(tokenIdx)
@@ -734,11 +702,10 @@ func (m *MuxClient) afterTransportCall(tokenIdx int, transport shared.Transport)
 	m.rateLimiter.UpdateFromHeaders(tokenIdx, transport.GetRateLimitInfo())
 }
 
-// randomEpoch returns a non-zero random int64 for use as a Batch.Epoch tag.
+// randomEpoch returns a non-zero random int64 for Batch.Epoch.
 func randomEpoch() int64 {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		// Fall back to nanosecond clock — collision possibility but acceptable.
 		return time.Now().UnixNano()
 	}
 	v := int64(binary.BigEndian.Uint64(b[:]))
@@ -748,5 +715,4 @@ func randomEpoch() int64 {
 	return v
 }
 
-// Ensure VirtualConn implements io.ReadWriteCloser.
 var _ io.ReadWriteCloser = (*VirtualConn)(nil)

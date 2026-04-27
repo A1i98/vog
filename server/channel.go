@@ -17,12 +17,10 @@ import (
 
 // destConn tracks one upstream destination tunnelled through this channel.
 //
-// A destConn is created the moment the server first sees the client's OPEN
-// frame. The actual TCP dial then runs in a goroutine — meanwhile any further
-// client frames for this conn are buffered in earlyData. Buffering is
-// essential: a single batch may carry the OPEN of conn A and 8 data frames
-// of conn B that's currently mid-dial; without buffering those B-frames
-// would be silently dropped (the original "stuck on telegram" bug).
+// Created on the first OPEN frame for that connID. The dial happens in a
+// goroutine — concurrent client frames for the same conn are buffered in
+// earlyData and replayed once dial completes. writeCh feeds a per-conn
+// writer goroutine so a slow upstream Write only blocks its own conn.
 type destConn struct {
 	connID    string
 	dst       string
@@ -32,10 +30,12 @@ type destConn struct {
 	closeOnce sync.Once
 
 	mu        sync.Mutex
-	pending   []shared.Frame  // outgoing frames (server → client)
-	earlyData []shared.Frame  // incoming frames buffered while dial in flight
-	dialed    bool            // dial complete (success or failure)
+	pending   []shared.Frame
+	earlyData []shared.Frame
+	dialed    bool
 	dialErr   error
+
+	writeCh chan []byte
 }
 
 func (d *destConn) enqueue(f shared.Frame) {
@@ -55,17 +55,18 @@ func (d *destConn) drain() []shared.Frame {
 func (d *destConn) close() {
 	d.closeOnce.Do(func() {
 		close(d.closed)
-		if d.conn != nil {
-			_ = d.conn.Close()
+		// dc.conn is written by dialAsync under d.mu; read under it too.
+		d.mu.Lock()
+		c := d.conn
+		d.mu.Unlock()
+		if c != nil {
+			_ = c.Close()
 		}
 	})
 }
 
-// ChannelHandler runs both directions of a single upstream channel.
-//
-// readClientLoop polls client.json for new batches and dispatches each
-// frame to the matching destConn. writeServerLoop drains pending frames
-// from each destConn and writes a server.json batch.
+// ChannelHandler owns one upstream channel: reads client.json, dispatches
+// to per-conn destinations, and writes server.json.
 type ChannelHandler struct {
 	cfg       *ServerConfig
 	channelID string
@@ -77,13 +78,9 @@ type ChannelHandler struct {
 	batchInterval time.Duration
 	fetchInterval time.Duration
 
-	// epoch is randomized per handler run; clients reset their dedup state
-	// when they observe an epoch change (e.g., server restart).
-	epoch int64
-
+	epoch          int64
 	serverBatchSeq atomic.Int64
 
-	// dedup state for client → server batches.
 	lastClientEpoch atomic.Int64
 	lastClientSeq   atomic.Int64
 	hadFirstRead    atomic.Bool
@@ -91,7 +88,6 @@ type ChannelHandler struct {
 	mu    sync.RWMutex
 	conns map[string]*destConn
 
-	// flushSig wakes the writer; same pattern as the client side.
 	flushSig chan struct{}
 }
 
@@ -142,16 +138,12 @@ func (h *ChannelHandler) Run(ctx context.Context) {
 	h.closeAll()
 }
 
-// signalFlush wakes writeServerLoop without blocking. Called whenever a
-// destConn enqueues a new outbound frame.
 func (h *ChannelHandler) signalFlush() {
 	select {
 	case h.flushSig <- struct{}{}:
 	default:
 	}
 }
-
-// ── client → destination ────────────────────────────────────────────────
 
 func (h *ChannelHandler) readClientLoop(ctx context.Context) {
 	timer := time.NewTimer(h.fetchInterval)
@@ -186,8 +178,6 @@ func (h *ChannelHandler) doReadClient(ctx context.Context) bool {
 	batch, err := h.transport.Read(ctx, h.channelID, shared.ClientBatchFile)
 	if err != nil {
 		if errors.Is(err, shared.ErrNotFound) {
-			// Channel may exist while the client batch file is not yet visible
-			// (race during EnsureChannel on the client side). Keep handler alive.
 			slog.Debug("client batch not found yet", "channel_id", h.channelID)
 			return true
 		}
@@ -198,7 +188,6 @@ func (h *ChannelHandler) doReadClient(ctx context.Context) bool {
 		return true
 	}
 
-	// Epoch-aware dedup. On epoch change, reset our view; on stale batch, drop.
 	lastEpoch := h.lastClientEpoch.Load()
 	lastSeq := h.lastClientSeq.Load()
 	if batch.Epoch != lastEpoch {
@@ -214,8 +203,6 @@ func (h *ChannelHandler) doReadClient(ctx context.Context) bool {
 		h.lastClientSeq.Store(batch.Seq)
 	}
 
-	// On the very first read, drop batches that are clearly stale (e.g. left
-	// behind from a previous session). With epoch this is mostly defensive.
 	if !h.hadFirstRead.Load() {
 		h.hadFirstRead.Store(true)
 		if batch.Age() > 60*time.Second {
@@ -239,23 +226,18 @@ func (h *ChannelHandler) handleClientFrame(ctx context.Context, f shared.Frame) 
 	h.mu.RUnlock()
 
 	if !ok {
-		// Unknown conn. We can only register it if this frame announces a Dst.
-		// A bare data frame for an unknown conn is a protocol violation —
-		// log at debug and drop.
 		if f.Dst == "" {
 			slog.Debug("data frame for unknown conn", "channel_id", h.channelID, "conn_id", f.ConnID)
 			return
 		}
-
 		newDC := &destConn{
-			connID: f.ConnID,
-			dst:    f.Dst,
-			closed: make(chan struct{}),
+			connID:  f.ConnID,
+			dst:     f.Dst,
+			closed:  make(chan struct{}),
+			writeCh: make(chan []byte, 64),
 		}
-
 		h.mu.Lock()
 		if existing, exists := h.conns[f.ConnID]; exists {
-			// Lost the race; another caller already registered this conn.
 			dc = existing
 			h.mu.Unlock()
 		} else {
@@ -266,11 +248,7 @@ func (h *ChannelHandler) handleClientFrame(ctx context.Context, f shared.Frame) 
 		}
 	}
 
-	// Buffer or process. We hold dc.mu for the decision so dialAsync can't
-	// race past us with a "dial complete" while we append to earlyData.
-	// We also capture dc.dialErr while holding the lock — reading those
-	// fields without synchronization is a data race even if the value is
-	// only written once during dialAsync.
+	// Capture dialed/dialErr under the lock — they're set by dialAsync.
 	dc.mu.Lock()
 	dialed := dc.dialed
 	dialErr := dc.dialErr
@@ -282,28 +260,15 @@ func (h *ChannelHandler) handleClientFrame(ctx context.Context, f shared.Frame) 
 	dc.mu.Unlock()
 
 	if dialErr != nil {
-		// Dial already failed and we already pushed an Error frame to the
-		// client. Quietly drop subsequent frames for this conn.
 		return
 	}
-
 	h.processClientFrame(dc, f)
 }
 
-// dialAsync dials dc.dst, then either replays buffered frames (success) or
-// emits a single FrameError (failure) and closes the conn.
-//
-// The "dialed" flag is the gate that handleClientFrame uses to decide
-// between buffering and direct processing. We must not set dialed=true
-// until the earlyData replay has fully drained — otherwise a new frame
-// arriving in the middle of replay would race the in-progress replay
-// (concurrent dc.conn.Write from two goroutines, plus out-of-order
-// delivery to the destination).
-//
-// The drain loop releases dc.mu around the actual I/O (processClientFrame
-// can do TCP writes that may block) and re-acquires it to check whether
-// new frames slipped into earlyData. Only when an iteration finds an
-// empty earlyData under lock do we set dialed=true and exit.
+// dialAsync dials dc.dst then replays buffered frames. We DO NOT set
+// dialed=true until the earlyData drain finishes — otherwise a new frame
+// hitting the fast path during replay would race the replay's writes to
+// dc.writeCh and break ordering.
 func (h *ChannelHandler) dialAsync(ctx context.Context, dc *destConn) {
 	conn, err := h.dialDestination(ctx, dc.dst)
 
@@ -311,7 +276,7 @@ func (h *ChannelHandler) dialAsync(ctx context.Context, dc *destConn) {
 		dc.mu.Lock()
 		dc.dialed = true
 		dc.dialErr = err
-		dc.earlyData = nil // any buffered data dies with the conn
+		dc.earlyData = nil
 		dc.mu.Unlock()
 
 		slog.Warn("dial failed",
@@ -341,10 +306,8 @@ func (h *ChannelHandler) dialAsync(ctx context.Context, dc *destConn) {
 		"dst", dc.dst,
 	)
 	go h.readDestLoop(ctx, dc)
+	go h.writeDestLoop(ctx, dc)
 
-	// Drain replay loop. handleClientFrame keeps appending to earlyData
-	// while dialed==false, so new arrivals join the back of the queue
-	// and are replayed in order alongside their predecessors.
 	dc.mu.Lock()
 	for {
 		early := dc.earlyData
@@ -362,7 +325,8 @@ func (h *ChannelHandler) dialAsync(ctx context.Context, dc *destConn) {
 	}
 }
 
-// processClientFrame applies one frame to an already-dialed destConn.
+// processClientFrame applies one frame to a dialed destConn. The TCP write
+// is handed to writeDestLoop so a slow target only stalls its own conn.
 func (h *ChannelHandler) processClientFrame(dc *destConn, f shared.Frame) {
 	switch f.Status {
 	case shared.FrameClosing, shared.FrameClosed, shared.FrameError:
@@ -396,21 +360,41 @@ func (h *ChannelHandler) processClientFrame(dc *destConn, f shared.Frame) {
 		return
 	}
 
-	_ = dc.conn.SetWriteDeadline(time.Now().Add(h.cfg.Proxy.TargetTimeout))
-	if _, err := dc.conn.Write(plaintext); err != nil {
-		dc.enqueue(shared.Frame{
-			ConnID: dc.connID,
-			Seq:    dc.seq.Add(1),
-			Status: shared.FrameError,
-			Error:  "destination write failed",
-		})
-		dc.close()
-		h.signalFlush()
+	select {
+	case dc.writeCh <- plaintext:
+	case <-dc.closed:
 	}
 }
 
-// readDestLoop reads from the upstream destination and enqueues encrypted
-// data frames to the writer side.
+// writeDestLoop drains dc.writeCh and serially writes to dc.conn. Started
+// once per conn after dialAsync succeeds.
+func (h *ChannelHandler) writeDestLoop(ctx context.Context, dc *destConn) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-dc.closed:
+			return
+		case data, ok := <-dc.writeCh:
+			if !ok {
+				return
+			}
+			_ = dc.conn.SetWriteDeadline(time.Now().Add(h.cfg.Proxy.TargetTimeout))
+			if _, err := dc.conn.Write(data); err != nil {
+				dc.enqueue(shared.Frame{
+					ConnID: dc.connID,
+					Seq:    dc.seq.Add(1),
+					Status: shared.FrameError,
+					Error:  "destination write failed",
+				})
+				dc.close()
+				h.signalFlush()
+				return
+			}
+		}
+	}
+}
+
 func (h *ChannelHandler) readDestLoop(ctx context.Context, dc *destConn) {
 	buf := make([]byte, h.cfg.Proxy.BufferSize)
 	for {
@@ -457,7 +441,6 @@ func (h *ChannelHandler) readDestLoop(ctx context.Context, dc *destConn) {
 				return
 			}
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				// Idle read timeout is expected; keep the destination connection open.
 				continue
 			}
 			dc.enqueue(shared.Frame{
@@ -472,8 +455,6 @@ func (h *ChannelHandler) readDestLoop(ctx context.Context, dc *destConn) {
 		}
 	}
 }
-
-// ── destination → client ────────────────────────────────────────────────
 
 func (h *ChannelHandler) writeServerLoop(ctx context.Context) {
 	batchInterval := h.batchInterval
@@ -567,15 +548,13 @@ func (h *ChannelHandler) flushServerFrames(ctx context.Context) {
 	h.gcConns(toGC)
 }
 
-// gcConns removes conn IDs whose final close frame has been flushed.
 func (h *ChannelHandler) gcConns(ids []string) {
 	if len(ids) == 0 {
 		return
 	}
 	h.mu.Lock()
 	for _, id := range ids {
-		// Re-check that the conn still has no pending frames before removing —
-		// a write-loss race could mean readDestLoop appended after our drain.
+		// Re-check pending: readDestLoop may have appended after we drained.
 		if dc, ok := h.conns[id]; ok {
 			dc.mu.Lock()
 			pendingEmpty := len(dc.pending) == 0
@@ -603,7 +582,6 @@ func (h *ChannelHandler) closeAll() {
 	}
 }
 
-// randomEpoch returns a non-zero random int64 used as Batch.Epoch.
 func randomEpoch() int64 {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {

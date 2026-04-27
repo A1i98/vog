@@ -27,14 +27,18 @@ const (
 
 // SOCKSServer is a SOCKS5 proxy server that tunnels connections through GitHub.
 type SOCKSServer struct {
-	listen  string
-	manager *MuxClient
-	timeout time.Duration
+	listen     string
+	manager    *MuxClient
+	timeout    time.Duration
+	bufferSize int
 }
 
-// NewSOCKSServer creates a SOCKSServer.
-func NewSOCKSServer(listen string, manager *MuxClient, timeout time.Duration) *SOCKSServer {
-	return &SOCKSServer{listen: listen, manager: manager, timeout: timeout}
+// NewSOCKSServer creates a SOCKSServer. bufferSize is the per-direction
+// io.Copy buffer used while relaying — sets the upper bound on bytes per
+// clientConn.Read (which becomes one chunk in the next outbound frame).
+// Pass <=0 to use io.Copy's default (32 KiB).
+func NewSOCKSServer(listen string, manager *MuxClient, timeout time.Duration, bufferSize int) *SOCKSServer {
+	return &SOCKSServer{listen: listen, manager: manager, timeout: timeout, bufferSize: bufferSize}
 }
 
 // ListenAndServe starts the SOCKS5 server. Blocks until ctx is cancelled.
@@ -92,11 +96,19 @@ func (s *SOCKSServer) handleConn(ctx context.Context, clientConn net.Conn) {
 
 	done := make(chan struct{}, 2)
 	go func() {
-		_, _ = io.Copy(vc, clientConn)
+		if s.bufferSize > 0 {
+			_, _ = io.CopyBuffer(vc, clientConn, make([]byte, s.bufferSize))
+		} else {
+			_, _ = io.Copy(vc, clientConn)
+		}
 		done <- struct{}{}
 	}()
 	go func() {
-		_, _ = io.Copy(clientConn, vc)
+		if s.bufferSize > 0 {
+			_, _ = io.CopyBuffer(clientConn, vc, make([]byte, s.bufferSize))
+		} else {
+			_, _ = io.Copy(clientConn, vc)
+		}
 		done <- struct{}{}
 	}()
 

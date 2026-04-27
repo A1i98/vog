@@ -2,7 +2,7 @@ package shared
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -19,9 +19,11 @@ import (
 )
 
 const (
-	channelsDir      = "channels"
-	syncInterval     = 200 * time.Millisecond
-	writeBatchWindow = 30 * time.Millisecond
+	channelsDir       = "channels"
+	syncInterval      = 200 * time.Millisecond
+	writeBatchWindow  = 30 * time.Millisecond
+	maxPushRetries    = 4
+	speculativePushOK = true
 )
 
 type writeRequest struct {
@@ -35,27 +37,30 @@ type writeEntry struct {
 }
 
 // GitSmartHTTPClient implements Transport via git push/pull (Smart HTTP).
-// Background syncer fetches every syncInterval.
-// Write calls are batched into a single push within a writeBatchWindow.
-// Read and ListChannels are local filesystem reads — zero network overhead.
 //
-// Locking:
-//   - mu protects the worktree (read concurrent, write exclusive). Network
-//     fetches do NOT hold mu so concurrent Read calls are not blocked while
-//     a fetch is in flight (a fetch can take 100ms–several seconds on a
-//     congested link).
-//   - fetchMu serializes concurrent fetches between the syncer and writer
-//     to avoid two simultaneous git fetches against the same repo.
+// Locking is load-bearing: go-git's *Repository is NOT safe for concurrent
+// fetch/push/commit/reset (we hit a real "concurrent map writes" panic in
+// idxfile.MemoryIndex.FindOffset otherwise).
+//
+//   - repoMu     — exclusive; held for any go-git call.
+//   - worktreeMu — RWMutex; RLock for Read/ListChannels (pure os ops),
+//                  Lock for the brief worktree mutations (Reset, file write).
+//
+// worktreeMu is released BEFORE the network push, so Reads run during push
+// and only block briefly during the reset/stage step. Lock order is always
+// repoMu → worktreeMu.
 type GitSmartHTTPClient struct {
 	auth       *githttp.BasicAuth
 	repoURL    string
 	mainBranch string
-	mu         sync.RWMutex
-	fetchMu    sync.Mutex
-	repo       *gogit.Repository
-	workDir    string
-	writeCh    chan *writeRequest
-	cancel     context.CancelFunc
+
+	repoMu     sync.Mutex
+	worktreeMu sync.RWMutex
+
+	repo    *gogit.Repository
+	workDir string
+	writeCh chan *writeRequest
+	cancel  context.CancelFunc
 }
 
 func NewGitSmartHTTPClient(token, repo string) (*GitSmartHTTPClient, error) {
@@ -137,89 +142,85 @@ func (c *GitSmartHTTPClient) EnsureChannel(ctx context.Context, existingID strin
 		id = existingID
 	}
 
-	placeholder, _ := json.Marshal(&Batch{Seq: 0, Ts: 0, Frames: []Frame{}})
+	placeholder, err := EncodeBatchBytes(&Batch{Seq: 0, Ts: 0, Frames: []Frame{}})
+	if err != nil {
+		return "", fmt.Errorf("EnsureChannel encode placeholder: %w", err)
+	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	const maxRetries = 3
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		if err := c.syncToRemote(ctx); err != nil {
-			return "", fmt.Errorf("EnsureChannel sync: %w", err)
-		}
-		w, err := c.repo.Worktree()
-		if err != nil {
-			return "", err
-		}
-		for _, fname := range []string{ClientBatchFile, ServerBatchFile} {
-			relPath := filepath.Join(channelsDir, id, fname)
-			if err := c.writeFileBytes(relPath, placeholder); err != nil {
-				return "", fmt.Errorf("EnsureChannel write %s: %w", fname, err)
-			}
-			if _, err := w.Add(relPath); err != nil {
-				return "", fmt.Errorf("EnsureChannel stage %s: %w", fname, err)
-			}
-		}
-		pushErr := c.commitAndPush(ctx, w, "new channel: "+id)
-		if pushErr == nil {
-			break
-		}
-		if !isGitNonFastForward(pushErr) || attempt == maxRetries-1 {
-			return "", fmt.Errorf("EnsureChannel push: %w", pushErr)
-		}
+	writes := []writeEntry{
+		{relPath: filepath.Join(channelsDir, id, ClientBatchFile), content: placeholder},
+		{relPath: filepath.Join(channelsDir, id, ServerBatchFile), content: placeholder},
+	}
+	if err := c.writeAndPush(ctx, writes, "new channel: "+id); err != nil {
+		return "", fmt.Errorf("EnsureChannel: %w", err)
 	}
 	return id, nil
 }
 
 // DeleteChannel removes channels/{channelID}/ and pushes the deletion.
 func (c *GitSmartHTTPClient) DeleteChannel(ctx context.Context, channelID string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.repoMu.Lock()
+	defer c.repoMu.Unlock()
 
-	const maxRetries = 3
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		if err := c.syncToRemote(ctx); err != nil {
-			return fmt.Errorf("DeleteChannel sync: %w", err)
+	var pushErr error
+	for attempt := 0; attempt < maxPushRetries; attempt++ {
+		if attempt > 0 || !speculativePushOK {
+			if err := c.fetchAndResetUnderRepoMu(ctx); err != nil {
+				pushErr = fmt.Errorf("DeleteChannel sync: %w", err)
+				continue
+			}
 		}
-		w, err := c.repo.Worktree()
-		if err != nil {
-			return fmt.Errorf("DeleteChannel worktree: %w", err)
+
+		c.worktreeMu.Lock()
+		w, wtErr := c.repo.Worktree()
+		if wtErr != nil {
+			c.worktreeMu.Unlock()
+			return fmt.Errorf("DeleteChannel worktree: %w", wtErr)
 		}
 
 		removed := false
+		var stageErr error
 		for _, fname := range []string{ClientBatchFile, ServerBatchFile} {
 			relPath := filepath.Join(channelsDir, channelID, fname)
 			if err := os.Remove(filepath.Join(c.workDir, relPath)); err != nil {
 				if os.IsNotExist(err) {
 					continue
 				}
-				return fmt.Errorf("DeleteChannel remove %s: %w", fname, err)
+				stageErr = fmt.Errorf("DeleteChannel remove %s: %w", fname, err)
+				break
 			}
 			if _, err := w.Remove(relPath); err != nil {
-				return fmt.Errorf("DeleteChannel stage %s: %w", fname, err)
+				stageErr = fmt.Errorf("DeleteChannel stage %s: %w", fname, err)
+				break
 			}
 			removed = true
 		}
 		_ = os.Remove(filepath.Join(c.workDir, channelsDir, channelID))
+		c.worktreeMu.Unlock()
 
+		if stageErr != nil {
+			return stageErr
+		}
 		if !removed {
 			return nil
 		}
-		pushErr := c.commitAndPush(ctx, w, "cleanup channel: "+channelID)
+
+		pushErr = c.commitAndPush(ctx, w, "cleanup channel: "+channelID)
 		if pushErr == nil {
 			return nil
 		}
-		if !isGitNonFastForward(pushErr) || attempt == maxRetries-1 {
+		if !isGitNonFastForward(pushErr) {
 			return pushErr
 		}
 	}
-	return nil
+	return pushErr
 }
 
 // ListChannels returns all subdirectories of channels/ from the local working tree.
+// Pure filesystem operation — does not touch go-git internals.
 func (c *GitSmartHTTPClient) ListChannels(_ context.Context) ([]*ChannelInfo, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.worktreeMu.RLock()
+	defer c.worktreeMu.RUnlock()
 
 	dir := filepath.Join(c.workDir, channelsDir)
 	entries, err := os.ReadDir(dir)
@@ -251,9 +252,9 @@ func (c *GitSmartHTTPClient) ListChannels(_ context.Context) ([]*ChannelInfo, er
 
 // Write queues a batch write; concurrent calls within writeBatchWindow share one push.
 func (c *GitSmartHTTPClient) Write(ctx context.Context, channelID, filename string, batch *Batch) error {
-	data, err := json.Marshal(batch)
+	data, err := EncodeBatchBytes(batch)
 	if err != nil {
-		return fmt.Errorf("git Write marshal: %w", err)
+		return fmt.Errorf("git Write encode: %w", err)
 	}
 	req := &writeRequest{
 		writes: []writeEntry{{
@@ -275,11 +276,11 @@ func (c *GitSmartHTTPClient) Write(ctx context.Context, channelID, filename stri
 	}
 }
 
-// Read reads channels/{channelID}/{filename} from the local working tree.
-// Returns (nil, nil) if the file doesn't exist or contains an empty batch.
+// Read parses channels/{channelID}/{filename} from the local working tree.
+// Pure os.ReadFile — never blocked by network ops, only by the brief reset.
 func (c *GitSmartHTTPClient) Read(_ context.Context, channelID, filename string) (*Batch, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.worktreeMu.RLock()
+	defer c.worktreeMu.RUnlock()
 
 	absPath := filepath.Join(c.workDir, channelsDir, channelID, filename)
 	data, err := os.ReadFile(absPath)
@@ -289,14 +290,14 @@ func (c *GitSmartHTTPClient) Read(_ context.Context, channelID, filename string)
 		}
 		return nil, fmt.Errorf("git Read %s/%s: %w", channelID, filename, err)
 	}
-	var batch Batch
-	if err := json.Unmarshal(data, &batch); err != nil {
+	batch, err := DecodeBatchBytes(data)
+	if err != nil {
 		return nil, fmt.Errorf("git Read %s/%s parse: %w", channelID, filename, err)
 	}
 	if batch.Seq == 0 && len(batch.Frames) == 0 {
 		return nil, nil
 	}
-	return &batch, nil
+	return batch, nil
 }
 
 func (c *GitSmartHTTPClient) GetRateLimitInfo() RateLimitInfo {
@@ -308,8 +309,6 @@ func (c *GitSmartHTTPClient) GetRateLimitInfo() RateLimitInfo {
 	}
 }
 
-// ── background goroutines ────────────────────────────────────────────────────
-
 func (c *GitSmartHTTPClient) runSyncer(ctx context.Context) {
 	for {
 		select {
@@ -317,33 +316,35 @@ func (c *GitSmartHTTPClient) runSyncer(ctx context.Context) {
 			return
 		case <-time.After(syncInterval):
 		}
-		// Network fetch happens OUTSIDE c.mu so concurrent Read calls on the
-		// worktree are not blocked while a fetch is in flight. The reset is
-		// quick and runs under c.mu briefly.
 		if err := c.fetchAndApply(ctx); err != nil {
 			slog.Debug("git transport: background sync failed", "error", err)
 		}
 	}
 }
 
-// fetchAndApply fetches from origin, then briefly takes c.mu to apply the
-// fetched HEAD to the worktree. This is what runSyncer calls every tick.
+// fetchAndApply runs one full sync cycle: fetch, then reset the worktree.
 func (c *GitSmartHTTPClient) fetchAndApply(ctx context.Context) error {
-	c.fetchMu.Lock()
-	fetchErr := c.repo.FetchContext(ctx, &gogit.FetchOptions{
+	c.repoMu.Lock()
+	defer c.repoMu.Unlock()
+	return c.fetchAndResetUnderRepoMu(ctx)
+}
+
+// fetchAndResetUnderRepoMu requires repoMu held by the caller.
+func (c *GitSmartHTTPClient) fetchAndResetUnderRepoMu(ctx context.Context) error {
+	err := c.repo.FetchContext(ctx, &gogit.FetchOptions{
 		RemoteName: "origin",
 		Auth:       c.auth,
 	})
-	c.fetchMu.Unlock()
-	if fetchErr != nil && fetchErr != gogit.NoErrAlreadyUpToDate {
-		return fmt.Errorf("git fetch: %w", fetchErr)
+	if err != nil && !errors.Is(err, gogit.NoErrAlreadyUpToDate) {
+		return fmt.Errorf("git fetch: %w", err)
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+
+	c.worktreeMu.Lock()
+	defer c.worktreeMu.Unlock()
 	return c.applyFetchedHead()
 }
 
-// applyFetchedHead resets the worktree to the remote HEAD. Caller must hold c.mu.
+// applyFetchedHead requires both repoMu and worktreeMu held by the caller.
 func (c *GitSmartHTTPClient) applyFetchedHead() error {
 	remoteRef := plumbing.NewRemoteReferenceName("origin", c.mainBranch)
 	ref, err := c.repo.Reference(remoteRef, true)
@@ -381,12 +382,9 @@ func (c *GitSmartHTTPClient) runBatchWriter(ctx context.Context) {
 		}
 		timer.Stop()
 
-		type finalWrite struct {
-			relPath string
-			content []byte
-		}
+		// Last-write-wins per path, preserving insertion order.
 		seen := make(map[string]bool, len(collected))
-		var order []finalWrite
+		var order []writeEntry
 		for path, reqs := range collected {
 			if seen[path] {
 				continue
@@ -395,48 +393,15 @@ func (c *GitSmartHTTPClient) runBatchWriter(ctx context.Context) {
 			last := reqs[len(reqs)-1]
 			for _, we := range last.writes {
 				if we.relPath == path {
-					order = append(order, finalWrite{path, we.content})
+					order = append(order, writeEntry{relPath: path, content: we.content})
 					break
 				}
 			}
 		}
 
-		c.mu.Lock()
-		var pushErr error
-		const maxRetries = 3
-		for attempt := 0; attempt < maxRetries; attempt++ {
-			if syncErr := c.syncToRemote(ctx); syncErr != nil {
-				pushErr = syncErr
-				break
-			}
-			w, wtErr := c.repo.Worktree()
-			if wtErr != nil {
-				pushErr = wtErr
-				break
-			}
-			var stageErr error
-			for _, fw := range order {
-				if err := c.writeFileBytes(fw.relPath, fw.content); err != nil {
-					stageErr = fmt.Errorf("batch write %s: %w", fw.relPath, err)
-					break
-				}
-				if _, err := w.Add(fw.relPath); err != nil {
-					stageErr = fmt.Errorf("batch stage %s: %w", fw.relPath, err)
-					break
-				}
-			}
-			if stageErr != nil {
-				pushErr = stageErr
-				break
-			}
-			pushErr = c.commitAndPush(ctx, w, "tunnel data")
-			if pushErr == nil || !isGitNonFastForward(pushErr) || attempt == maxRetries-1 {
-				break
-			}
-			pushErr = nil
-		}
-		c.mu.Unlock()
+		pushErr := c.writeAndPush(ctx, order, "tunnel data")
 
+		// Notify every waiting Write call.
 		for _, reqs := range collected {
 			for _, req := range reqs {
 				req.done <- pushErr
@@ -445,24 +410,55 @@ func (c *GitSmartHTTPClient) runBatchWriter(ctx context.Context) {
 	}
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// writeAndPush stages files and pushes. First attempt skips the pre-fetch
+// (the syncer keeps us at remote HEAD); on non-fast-forward we fetch+reset
+// and retry. Caller must NOT already hold repoMu.
+func (c *GitSmartHTTPClient) writeAndPush(ctx context.Context, order []writeEntry, msg string) error {
+	c.repoMu.Lock()
+	defer c.repoMu.Unlock()
 
-// syncToRemote is called by writers (EnsureChannel, DeleteChannel, runBatchWriter)
-// while holding c.mu — the fetch is serialized via fetchMu so it doesn't
-// race the syncer's fetch.
-//
-// Caller must hold c.mu (write lock).
-func (c *GitSmartHTTPClient) syncToRemote(ctx context.Context) error {
-	c.fetchMu.Lock()
-	fetchErr := c.repo.FetchContext(ctx, &gogit.FetchOptions{
-		RemoteName: "origin",
-		Auth:       c.auth,
-	})
-	c.fetchMu.Unlock()
-	if fetchErr != nil && fetchErr != gogit.NoErrAlreadyUpToDate {
-		return fmt.Errorf("git fetch: %w", fetchErr)
+	var pushErr error
+	for attempt := 0; attempt < maxPushRetries; attempt++ {
+		if attempt > 0 || !speculativePushOK {
+			if err := c.fetchAndResetUnderRepoMu(ctx); err != nil {
+				pushErr = err
+				continue
+			}
+		}
+
+		c.worktreeMu.Lock()
+		w, wtErr := c.repo.Worktree()
+		if wtErr != nil {
+			c.worktreeMu.Unlock()
+			return fmt.Errorf("worktree: %w", wtErr)
+		}
+		var stageErr error
+		for _, fw := range order {
+			if err := c.writeFileBytes(fw.relPath, fw.content); err != nil {
+				stageErr = fmt.Errorf("batch write %s: %w", fw.relPath, err)
+				break
+			}
+			if _, err := w.Add(fw.relPath); err != nil {
+				stageErr = fmt.Errorf("batch stage %s: %w", fw.relPath, err)
+				break
+			}
+		}
+		c.worktreeMu.Unlock()
+
+		if stageErr != nil {
+			return stageErr
+		}
+
+		pushErr = c.commitAndPush(ctx, w, msg)
+		if pushErr == nil {
+			return nil
+		}
+		if !isGitNonFastForward(pushErr) {
+			return pushErr
+		}
+		slog.Debug("git push non-fast-forward; will fetch+retry", "attempt", attempt+1)
 	}
-	return c.applyFetchedHead()
+	return pushErr
 }
 
 func (c *GitSmartHTTPClient) writeFileBytes(relPath string, content []byte) error {
@@ -473,6 +469,7 @@ func (c *GitSmartHTTPClient) writeFileBytes(relPath string, content []byte) erro
 	return os.WriteFile(absPath, content, 0o600)
 }
 
+// commitAndPush requires repoMu. Does not touch the worktree.
 func (c *GitSmartHTTPClient) commitAndPush(ctx context.Context, w *gogit.Worktree, msg string) error {
 	_, err := w.Commit(msg, &gogit.CommitOptions{
 		Author: &object.Signature{
@@ -490,7 +487,7 @@ func (c *GitSmartHTTPClient) commitAndPush(ctx context.Context, w *gogit.Worktre
 		return fmt.Errorf("git commit: %w", err)
 	}
 	pushErr := c.repo.PushContext(ctx, &gogit.PushOptions{Auth: c.auth})
-	if pushErr == gogit.NoErrAlreadyUpToDate {
+	if errors.Is(pushErr, gogit.NoErrAlreadyUpToDate) {
 		return nil
 	}
 	return pushErr
@@ -549,7 +546,7 @@ func seedEmptyRepo(workDir, repoURL string, auth *githttp.BasicAuth) (*gogit.Rep
 	if err := r.PushContext(context.Background(), &gogit.PushOptions{
 		RemoteName: "origin",
 		Auth:       auth,
-	}); err != nil && err != gogit.NoErrAlreadyUpToDate {
+	}); err != nil && !errors.Is(err, gogit.NoErrAlreadyUpToDate) {
 		return nil, fmt.Errorf("initial push: %w", err)
 	}
 	return r, nil

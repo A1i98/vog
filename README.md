@@ -20,14 +20,11 @@ Two transports, picked per-token:
 
 ## Does it actually work?
 
-**Yes, but it's slow and has real limits.**
+**Barely.** It's a proof-of-concept, not a real VPN. One tunnel round-trip
+is one git push + one fetch ≈ **1.5–2 s** even on a fast connection.
 
-- Every batch of frames is one round-trip to `api.github.com` or `github.com` → **100–500 ms latency per batch**.
-- All virtual connections multiplex through one batch per channel — so a single `git push` carries data for many in-flight TCP streams (handshake, reads, writes) at once instead of one HTTP request per packet.
-- **`gist` transport**: bound by GitHub's **secondary rate limit of ~500 content-generating writes/hr per account**.
-- **`git` transport** (recommended for high traffic): push/pull over git Smart HTTP uses a **completely separate rate-limit pool** with no hard published per-hour write ceiling. Far more headroom.
-- New GitHub accounts have much lower REST limits (~100 req/hr). The `git` transport is unaffected.
-- Interactive sessions (SSH, light browsing, Telegram) work fine on the `git` transport. Video or large downloads will exhaust the `gist` transport quota fast.
+The tool exists because it's an interesting hack, not because GitHub is a
+good carrier for IP traffic.
 
 ## Install
 

@@ -20,7 +20,7 @@ Two transports, picked per-token:
 
 ## Does it actually work?
 
-**Barely.** It's a proof-of-concept, not a real VPN. One tunnel round-trip
+**Too slow. Not usable.** It's a proof-of-concept, not a real VPN. One tunnel round-trip
 is one git push + one fetch ≈ **1.5–2 s** even on a fast connection.
 
 The tool exists because it's an interesting hack, not because GitHub is a

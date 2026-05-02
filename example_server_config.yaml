@@ -42,4 +42,6 @@ encryption:
 logging:
   level: "info"
   format: "text"
-  file: "/var/log/gh-tunnel/server.log"
+  # Empty string or omit → stdout. Set a path to log to a file instead.
+  # When run under systemd, leave empty and use `journalctl -u gh-tunnel-server -f`.
+  file: ""
